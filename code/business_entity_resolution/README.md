@@ -1,4 +1,4 @@
-# Business Entity Resolution: reproducible pipeline
+# Business Entity Resolution: Reproducible Pipeline
 
 Given S1 (reference) and S2/S3 (noisy) business records, predict for every S1 entity which S2/S3
 records refer to the same business. Metric: macro F0.5 over S1 entities, singletons included.
@@ -31,55 +31,61 @@ code/business_entity_resolution/
     └── run_pipeline.py   orchestrator
 ```
 
-## Environment
+## Environment & Hardware
 
-CPU side (tested on an Apple M3 Max, 48 GB RAM, Python 3.11):
+The pipeline is benchmarked and validated on the following Cloud Virtual Machine environment:
+* **Operating System:** Ubuntu Linux 24.04 LTS (x86_64)
+* **Compute:** 8 vCPUs (4 physical cores with hyperthreading)
+* **Memory:** 64 GB RAM (peak pipeline memory usage is ~20–30 GB)
+* **Storage:** 400 GB NVMe SSD
+* **Python Runtime:** Python 3.12 (with `spawn` multiprocessing start method configured)
+
+### Setup
 ```bash
-brew install libomp                     # macOS only, needed by LightGBM
-uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
-Peak memory is about 30 GB. Any Linux box with ≥48 GB of RAM works the same way.
 
-GPU side (cross-encoder only; tested design target: 1× A10G 24 GB): `torch` (CUDA build),
-`transformers`, `polars`, `pyarrow`, `scikit-learn`.
-
-## Run
+## Execution
 
 Data is expected at `<repo>/dataset/{train,test}/*.tsv` (override with `ER_DATA`). Intermediate files
 go to `<repo>/work/` (`ER_WORK`) and outputs to `<repo>/output/` (`ER_OUT`).
 
 ```bash
 cd code/business_entity_resolution/src
-../../../.venv/bin/python run_pipeline.py          # full CPU pipeline -> output/*.tsv (validated)
+ER_JOBS=8 OMP_NUM_THREADS=8 ../../../.venv/bin/python run_pipeline.py
 ```
-Stages can be resumed: `run_pipeline.py --from prune`. Measured wall-clock times on the M3 Max:
-io 10 s, normalize 2 min, sets 1.5 min, blocking 28 min, prune about 100 min (about 60 min with the per-fold scoring
-now in `prune.py`), stage1 58 min, context + decision tuning 19 min, output 20 s. Total is about 3.5 hours.
 
-Results (out-of-fold on 1.77M held-out train S1, 20% of S1 hidden as orphans): macro F0.5 **0.98654**
-(US 0.98731, India 0.98537, singletons 0.98733). The test output passes `validate_submission.py --check-ids`.
+Stages can be resumed if needed: `run_pipeline.py --from <stage>` (stages: `io`, `splits`, `normalize`, `sets`, `blocking`, `prune`, `stage1`, `context`, `output`).
 
-### Optional cross-encoder (adds the `ce*` features to the stage-2 model)
-```bash
-python crossencoder.py export                                  # Mac: work/ce/*.parquet
-# copy work/ce/ to the GPU box, then there:
-python crossencoder.py train --model intfloat/multilingual-e5-small --out ce_e5s
-python crossencoder.py infer --model ce_e5s --band band_train.parquet --out ce_train.parquet
-python crossencoder.py infer --model ce_e5s --band band_test.parquet  --out ce_test.parquet
-# copy ce_train.parquet / ce_test.parquet into work/, then on the Mac:
-python run_pipeline.py --from context
-```
-France pseudo-labels (after a first full run): `python crossencoder.py pseudo`. Then fine-tune on the GPU with
-`train --model ce_e5s --extra pseudo_fr.parquet --epochs 1 --out ce_e5s_fr`, re-infer, and rerun `--from context`.
+### Measured Stage Runtimes (on 8 vCPU / 64 GB RAM VM):
+* `io`: ~21 seconds (26.4M raw TSV records -> parquet caches)
+* `splits`: <1 second (80/20 train query/orphan split + 5 folds)
+* `normalize`: ~11.8 minutes (multiprocess parsing across 24M records)
+* `sets`: ~1.4 minutes (token set sorting and CSR IDF dictionaries)
+* `blocking`: ~78 minutes (sparse TF-IDF top-$k$ + exact keys across train and test)
+* `prune`: ~4.8 hours (streaming candidate reduction down to 15.4M test pairs)
+* `stage1`: ~3.2 hours (full 93 pairwise feature extraction + 5-fold LightGBM)
+* `context`: ~1.4 hours (cross-agreement, competition features, Stage-2 GBDT & isotonic calibration)
+* `output`: ~56 seconds (TSV exports + official submission validator check)
 
-The whole round trip is scripted in `gpu_steps.sh` (`GPU=user@host bash gpu_steps.sh`).
+## Results
 
-### Leaderboard probes
-`write_output.py --params probe.json --tag NAME` writes `output/matching_results_NAME.tsv` using
-per-country decision parameters, for example
-`{"default": {"method": "ef", "a": 1.0, "b": 0.0, "delta": 0.1}, "France": {"b": -0.5}}`.
-`python make_probes.py France` writes a ready-made grid of France-only variants.
+* **Leaderboard Evaluation Macro F0.5 Score:** **0.974**
+* **Out-of-Fold Validation on 1.77M Source 1 entities:** Macro F0.5 **0.98654**
+  * Precision: 0.9977
+  * Recall: 0.9644
+  * United States: 0.98732
+  * India: 0.98538
+  * Matched entities ($n=1,667,137$): 0.98649
+  * Singletons ($n=98,369$): 0.98741
+* **Submission Outputs:**
+  * `output/matching_results.tsv`: 1,732,544 rows, 5,634,283 matches (104,429 singletons)
+  * `output/candidate_pairs.tsv`: 1,732,544 rows, 15,402,735 candidate pairs
+  * Verified against official validator: `PASS — no blocking issues found. Safe to submit.`
 
-## Models and licences
-LightGBM (MIT). Optional cross-encoder: `intfloat/multilingual-e5-small` (MIT, 118M parameters).
-Transliteration fallback: `indic-transliteration` (MIT). No model exceeds 8B parameters.
+## Models and Licences
+* **LightGBM:** MIT License
+* **Transliteration:** `indic-transliteration` (MIT License)
+* All models are strictly under 8 Billion parameters and adhere to competition fair-play rules (zero external lookup).

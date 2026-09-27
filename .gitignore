@@ -1,6 +1,7 @@
 # Dataset files
 dataset/
 dataset.zip
+*.zip
 
 # Virtual environments
 .venv
